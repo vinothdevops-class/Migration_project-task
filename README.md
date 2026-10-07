@@ -1,4 +1,4 @@
-# FinNova Retail – Order Management Cloud Migration 
+# End-to-End Cloud Migration (Infra + Application + Data)
 Target cloud: **AWS us-east-1** (EKS, Aurora MySQL 8.0, S3, Secrets Manager, KMS, DMS).
 ## What is here
 This repository contains an end-to-end AWS cloud migration project covering infrastructure, application, database migration, security, CI/CD, and cost optimisation. The target platform is AWS us-east-1.
