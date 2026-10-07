@@ -1,0 +1,20 @@
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: order-service
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: order-service }
+  minReplicas: 3          # one per AZ
+  maxReplicas: 12         # sales-event headroom; Cluster Autoscaler adds nodes when pods are pending
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 65 } }
+    - type: Resource
+      resource: { name: memory, target: { type: Utilization, averageUtilization: 75 } }
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies: [{ type: Percent, value: 100, periodSeconds: 30 }]   # double quickly on a flash sale
+    scaleDown:
+      stabilizationWindowSeconds: 300                                 # scale in slowly to avoid flapping
+      policies: [{ type: Pods, value: 1, periodSeconds: 60 }]

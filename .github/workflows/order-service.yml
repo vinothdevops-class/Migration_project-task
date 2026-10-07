@@ -1,0 +1,132 @@
+# Order service: build -> test -> scan -> push -> deploy dev -> staging -> (manual approval) -> prod
+# Security: no stored AWS keys (GitHub OIDC -> short-lived role), image promoted by immutable DIGEST,
+# every third-party action should be pinned to a reviewed commit SHA before production use.
+name: order-service
+
+on:
+  pull_request:
+    paths: ["app/order-service/**", "k8s/order-service/**", ".github/workflows/order-service.yml", ".github/workflows/deploy.yml"]
+  push:
+    branches: [main]
+    paths: ["app/order-service/**", "k8s/order-service/**", ".github/workflows/order-service.yml", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: order-service-${{ github.ref }}
+  cancel-in-progress: false          # never cancel a half-finished deploy
+
+env:
+  AWS_REGION: us-east-1
+  APP_DIR: app/order-service
+  TRIVY_IMAGE: aquasec/trivy:0.67.2   # pin by digest in production
+
+jobs:
+  # ---------------------------------------------------------------- 1. lint + unit test
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ env.APP_DIR }}/package-lock.json
+      - run: npm ci
+        working-directory: ${{ env.APP_DIR }}
+      - run: npm run lint
+        working-directory: ${{ env.APP_DIR }}
+      - run: npm test
+        working-directory: ${{ env.APP_DIR }}
+      - name: Validate Kubernetes manifests (kustomize render + kubeconform)
+        run: |
+          curl -sSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.7.1/kustomize_v5.7.1_linux_amd64.tar.gz | tar xz
+          curl -sSL https://github.com/yannh/kubeconform/releases/download/v0.7.0/kubeconform-linux-amd64.tar.gz | tar xz
+          for e in dev staging prod; do ./kustomize build k8s/order-service/overlays/$e | ./kubeconform -strict -summary -kubernetes-version 1.33.0; done
+
+  # ---------------------------------------------------------------- 2. build, scan, push (main only)
+  build-scan-push:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write                 # OIDC token for AWS
+    outputs:
+      image: ${{ steps.out.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local, not pushed yet)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.APP_DIR }}
+          load: true
+          tags: order-service:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Trivy - image vulnerabilities (fail on fixable HIGH/CRITICAL)
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+            --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress \
+            order-service:${{ github.sha }}
+
+      - name: Trivy - misconfiguration scan of Dockerfile, K8s manifests and Terraform
+        run: |
+          docker run --rm -v "$PWD:/src" "$TRIVY_IMAGE" config --ignorefile /src/.trivyignore \
+            --severity HIGH,CRITICAL --exit-code 1 /src
+
+      - name: Stop here for pull requests
+        if: github.event_name == 'pull_request'
+        run: echo "PR build and scans passed; images are only pushed from main."
+
+      - name: AWS credentials via OIDC (build role can only push to this ECR repo)
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_BUILD_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push to ECR (repo has IMMUTABLE tags + scan-on-push)
+        if: github.event_name != 'pull_request'
+        env:
+          REPO: ${{ steps.ecr.outputs.registry }}/finnova/order-service
+        run: |
+          docker tag order-service:${{ github.sha }} "$REPO:${{ github.sha }}"
+          docker push "$REPO:${{ github.sha }}"
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$REPO:${{ github.sha }}")
+          echo "DIGEST_REF=$DIGEST" >> "$GITHUB_ENV"
+
+      - id: out
+        if: github.event_name != 'pull_request'
+        run: echo "image=${DIGEST_REF}" >> "$GITHUB_OUTPUT"   # e.g. 1111.dkr.ecr...@sha256:abc...
+
+  # ---------------------------------------------------------------- 3. promotion: dev -> staging -> prod
+  deploy-dev:
+    if: github.event_name != 'pull_request'
+    needs: build-scan-push
+    uses: ./.github/workflows/deploy.yml
+    with: { environment: dev, image: "${{ needs.build-scan-push.outputs.image }}" }
+    permissions: { contents: read, id-token: write }
+
+  deploy-staging:
+    needs: [build-scan-push, deploy-dev]
+    uses: ./.github/workflows/deploy.yml
+    with: { environment: staging, image: "${{ needs.build-scan-push.outputs.image }}" }
+    permissions: { contents: read, id-token: write }
+
+  deploy-prod:
+    # The "prod" GitHub Environment has required reviewers (release manager + one other, no self-review)
+    # and only allows the main branch -> this job WAITS for manual approval before it starts.
+    needs: [build-scan-push, deploy-staging]
+    uses: ./.github/workflows/deploy.yml
+    with: { environment: prod, image: "${{ needs.build-scan-push.outputs.image }}" }
+    permissions: { contents: read, id-token: write }

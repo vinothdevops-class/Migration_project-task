@@ -1,0 +1,74 @@
+# Reusable deploy job: same steps for every environment; only the GitHub Environment differs
+# (its role ARN, cluster name, URL and protection rules).
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment: { type: string, required: true }
+      image:       { type: string, required: true }   # repo@sha256:digest - same artifact in every env
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04            # prod: use a self-hosted runner inside the VPC (EKS API is private)
+    environment:
+      name: ${{ inputs.environment }}
+      url: https://orders.${{ inputs.environment }}.finnova.example
+    env:
+      AWS_REGION: us-east-1
+      OVERLAY: k8s/order-service/overlays/${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: AWS credentials via OIDC (deploy role scoped to this environment's cluster)
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: kubeconfig + tools
+        run: |
+          aws eks update-kubeconfig --name "${{ vars.CLUSTER_NAME }}" --region "$AWS_REGION"
+          curl -sSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.7.1/kustomize_v5.7.1_linux_amd64.tar.gz | tar xz -C /usr/local/bin
+
+      - name: Record current revision (rollback point)
+        id: before
+        run: |
+          REV=$(kubectl -n orders get deploy order-service -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null || echo none)
+          echo "revision=$REV" >> "$GITHUB_OUTPUT"
+          echo "Current revision: $REV"
+
+      - name: Render with the digest-pinned image and apply (rolling update, maxUnavailable 0)
+        run: |
+          cd "$OVERLAY"
+          kustomize edit set image ORDER_SERVICE_IMAGE="${{ inputs.image }}"
+          kustomize build . > /tmp/rendered.yaml
+          grep -q '@sha256:' /tmp/rendered.yaml || { echo "refusing to deploy a mutable tag"; exit 1; }
+          kubectl apply --server-side -f /tmp/rendered.yaml
+
+      - name: Wait for rollout
+        run: kubectl -n orders rollout status deploy/order-service --timeout=300s
+
+      - name: Smoke test (readiness + idempotent order)
+        run: |
+          BASE="https://orders.${{ inputs.environment }}.finnova.example"
+          for i in 1 2 3 4 5; do curl -fsS "$BASE/orders/00000000-0000-4000-8000-000000000000" -o /dev/null -w '%{http_code}\n' | grep -qE '200|404' && break; sleep 5; done
+          KEY="smoke-${{ github.run_id }}-${{ inputs.environment }}"
+          curl -fsS -X POST "$BASE/orders" -H 'content-type: application/json' -H "Idempotency-Key: $KEY" \
+            -d '{"customerId":"SMOKE","items":[{"sku":"SMOKE-1","quantity":1}]}'
+
+      - name: Automatic rollback on any failure above
+        if: failure()
+        run: |
+          if [ "${{ steps.before.outputs.revision }}" != "none" ]; then
+            kubectl -n orders rollout undo deploy/order-service --to-revision="${{ steps.before.outputs.revision }}"
+            kubectl -n orders rollout status deploy/order-service --timeout=300s
+            echo "::error::Deploy failed - rolled back to revision ${{ steps.before.outputs.revision }}; promotion stopped."
+          else
+            echo "::error::First deploy failed - nothing to roll back to; investigate."
+          fi
+          exit 1

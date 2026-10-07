@@ -1,0 +1,51 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: orders
+resources:
+  - ../../base
+images:
+  - name: ORDER_SERVICE_IMAGE
+    newName: 222222222222.dkr.ecr.us-east-1.amazonaws.com/finnova/order-service
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000  # set by pipeline
+patches:
+  - target: { kind: ServiceAccount, name: order-service }
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/eks.amazonaws.com~1role-arn
+        value: arn:aws:iam::222222222222:role/finnova-om-staging-order-service
+  - target: { kind: ConfigMap, name: order-service-config }
+    patch: |-
+      - op: replace
+        path: /data/DB_HOST
+        value: finnova-om-staging-aurora.cluster-EXAMPLE.us-east-1.rds.amazonaws.com
+      - op: replace
+        path: /data/DB_SECRET_ARN
+        value: arn:aws:secretsmanager:us-east-1:222222222222:secret:rds!cluster-EXAMPLE
+  - target: { kind: HorizontalPodAutoscaler, name: order-service }
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 6
+  - target: { kind: Ingress, name: order-service }
+    patch: |-
+      - op: replace
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1certificate-arn
+        value: arn:aws:acm:us-east-1:222222222222:certificate/EXAMPLE
+      - op: replace
+        path: /metadata/annotations/alb.ingress.kubernetes.io~1security-groups
+        value: sg-EXAMPLE
+      - op: replace
+        path: /spec/rules/0/host
+        value: orders.staging.finnova.example
+  - target: { kind: NetworkPolicy, name: order-service }   # this env's VPC CIDR is 10.20.0.0/16
+    patch: |-
+      - { op: replace, path: /spec/ingress/0/from/0/ipBlock/cidr, value: 10.20.0.0/24 }
+      - { op: replace, path: /spec/ingress/0/from/1/ipBlock/cidr, value: 10.20.1.0/24 }
+      - { op: replace, path: /spec/ingress/0/from/2/ipBlock/cidr, value: 10.20.2.0/24 }
+      - { op: replace, path: /spec/egress/1/to/0/ipBlock/cidr, value: 10.20.200.0/22 }
+      - { op: replace, path: /spec/egress/4/to/0/ipBlock/cidr, value: 10.20.16.0/20 }
+      - { op: replace, path: /spec/egress/4/to/1/ipBlock/cidr, value: 10.20.32.0/20 }
+      - { op: replace, path: /spec/egress/4/to/2/ipBlock/cidr, value: 10.20.48.0/20 }

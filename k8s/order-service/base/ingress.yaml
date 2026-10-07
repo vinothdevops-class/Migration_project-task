@@ -1,0 +1,23 @@
+# Provisioned by the AWS Load Balancer Controller -> internet-facing ALB in the public subnets.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: order-service
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/certificate-arn: REPLACED_BY_OVERLAY
+    alb.ingress.kubernetes.io/security-groups: REPLACED_BY_OVERLAY       # module.networking.alb_security_group_id
+    alb.ingress.kubernetes.io/healthcheck-path: /readyz
+    alb.ingress.kubernetes.io/target-group-attributes: deregistration_delay.timeout_seconds=30
+spec:
+  ingressClassName: alb
+  rules:
+    - host: REPLACED_BY_OVERLAY
+      http:
+        paths:
+          - path: /orders
+            pathType: Prefix
+            backend: { service: { name: order-service, port: { name: http } } }

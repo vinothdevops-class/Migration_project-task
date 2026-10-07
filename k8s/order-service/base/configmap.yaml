@@ -1,0 +1,10 @@
+# Non-secret configuration only. Credentials are never in ConfigMaps, env vars or the image.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-service-config
+data:
+  DB_HOST: REPLACED_BY_OVERLAY
+  DB_NAME: orders
+  DB_SECRET_ARN: REPLACED_BY_OVERLAY   # an ARN is a pointer, not a secret
+  DRAIN_SECONDS: "10"

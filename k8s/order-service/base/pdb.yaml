@@ -1,0 +1,8 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: order-service
+spec:
+  minAvailable: 2          # node drains / upgrades never take the service below 2 pods
+  selector:
+    matchLabels: { app.kubernetes.io/name: order-service }

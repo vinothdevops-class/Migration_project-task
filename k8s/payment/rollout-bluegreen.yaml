@@ -1,0 +1,113 @@
+# Payment service: blue/green release with Argo Rollouts, inside the PCI-isolated boundary.
+# - runs only on the tainted "payment" node group, in its own namespace (prod: its own AWS account/cluster)
+# - "active" Service carries live traffic (blue); "preview" Service reaches green for private smoke tests
+# - promotion is MANUAL after automated analysis passes; blue stays up for instant rollback
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payment-service
+  namespace: payment
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels: { app.kubernetes.io/name: payment-service }
+  strategy:
+    blueGreen:
+      activeService: payment-active
+      previewService: payment-preview
+      autoPromotionEnabled: false          # change ticket + release owner approve the switch
+      previewReplicaCount: 3               # green at full size before it gets traffic
+      scaleDownDelaySeconds: 3600          # keep blue warm 1 h after switch for instant rollback
+      prePromotionAnalysis:
+        templates: [{ templateName: payment-smoke-and-slo }]
+      postPromotionAnalysis:
+        templates: [{ templateName: payment-smoke-and-slo }]   # auto-abort back to blue if it degrades
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: payment-service, pci: "true" }
+    spec:
+      serviceAccountName: payment-service          # IRSA role: payment secrets + payment KMS key only
+      tolerations:
+        - { key: pci, operator: Equal, value: "true", effect: NoSchedule }
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: payment
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: payment-service
+          image: PAYMENT_SERVICE_IMAGE             # digest-pinned by the pipeline
+          ports: [{ name: https, containerPort: 8443 }]
+          resources:
+            requests: { cpu: 250m, memory: 384Mi }
+            limits:   { cpu: "1",  memory: 768Mi }
+          readinessProbe:
+            httpGet: { path: /readyz, port: https, scheme: HTTPS }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: https, scheme: HTTPS }
+            periodSeconds: 10
+          lifecycle:
+            preStop: { sleep: { seconds: 20 } }   # finish in-flight authorisations before shutdown
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: payment-active, namespace: payment }
+spec:
+  selector: { app.kubernetes.io/name: payment-service }   # Argo adds the blue/green hash selector
+  ports: [{ name: https, port: 8443, targetPort: https }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: payment-preview, namespace: payment }
+spec:
+  selector: { app.kubernetes.io/name: payment-service }
+  ports: [{ name: https, port: 8443, targetPort: https }]
+---
+# Gate: green must pass synthetic sandbox transactions AND stay inside SLOs.
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata: { name: payment-smoke-and-slo, namespace: payment }
+spec:
+  metrics:
+    - name: sandbox-transactions        # authorise -> capture -> refund against processor SANDBOX, idempotent retry
+      count: 1
+      provider:
+        job:
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                serviceAccountName: payment-smoke
+                containers:
+                  - name: smoke
+                    image: PAYMENT_SMOKE_IMAGE
+                    args: ["--target", "https://payment-preview.payment.svc:8443", "--mode", "sandbox"]
+    - name: error-rate
+      interval: 1m
+      count: 10
+      successCondition: result[0] < 0.01            # < 1 % 5xx
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc:9090
+          query: |
+            sum(rate(http_requests_total{app="payment-service",code=~"5.."}[2m]))
+            / sum(rate(http_requests_total{app="payment-service"}[2m]))
+    - name: duplicate-charges
+      interval: 1m
+      count: 10
+      successCondition: result[0] == 0              # any duplicate charge = immediate abort
+      failureLimit: 0
+      provider:
+        prometheus:
+          address: http://prometheus.monitoring.svc:9090
+          query: sum(increase(payment_duplicate_charge_total[5m]))
