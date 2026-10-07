@@ -49,7 +49,7 @@ Applies run only from CI (plan on PR, apply on merge, approval for prod).
 | DMS migration, cutover timing, payment release | **Design + scripts only**; must be rehearsed in staging |
 | Payment service code | Not included – the release and isolation design is documented; `order-service` is the containerised example |
 | Account IDs, ARNs, hostnames, CIDRs | **Placeholders** |
-| On-prem costs | **Assumed** – replace with real invoices |
+
 
 Before production: pin GitHub Actions and base images by SHA/digest, configure GitHub Environments
 (`dev`, `staging`, `prod` with 2 required reviewers) and variables (`AWS_BUILD_ROLE_ARN`, `AWS_DEPLOY_ROLE_ARN`, `CLUSTER_NAME`),
